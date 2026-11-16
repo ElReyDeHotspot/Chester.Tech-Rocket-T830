@@ -1,0 +1,38 @@
+name: Validate OTA tooling
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          persist-credentials: false
+      - name: Install test dependencies
+        run: sudo apt-get update && sudo apt-get install --yes jq openssl
+      - name: Validate shell syntax
+        run: bash -n firmware-overlay/usr/sbin/chester-ota
+      - name: Test signed metadata and isolated client behavior
+        run: python3 -m unittest discover -s tests -v
+      - name: Refuse committed firmware and private keys
+        shell: python
+        run: |
+          import pathlib
+          import subprocess
+          files = subprocess.check_output(['git', 'ls-files', '-z']).decode().split('\0')
+          for name in filter(None, files):
+              p = pathlib.Path(name)
+              if p.suffix.lower() in {'.bin', '.img', '.squashfs', '.key'}:
+                  raise SystemExit(f'Unexpected firmware/private-key artifact: {name}')
+              data = p.read_bytes()
+              markers = [b'-----BEGIN ' + kind + b'PRIVATE KEY-----' for kind in (b'', b'EC ', b'RSA ')]
+              if any(marker in data for marker in markers):
+                  raise SystemExit(f'Private key material found: {name}')

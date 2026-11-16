@@ -1,0 +1,91 @@
+#!/bin/sh
+# Root-only, signed, manually confirmed OTA for the Rocket T830 AP firmware.
+set -eu
+REPO='ElReyDeHotspot/Chester.Tech-Rocket-T830'
+BASE_URL="https://github.com/$REPO/releases/latest/download"
+KEY=/etc/chester-ota/public.pem
+SEQUENCE_FILE=/etc/chester-ota/installed-sequence
+LOCK=/tmp/chester-ota.lock
+MAX_IMAGE=100663296
+
+fail() { printf '%s\n' "$*" >&2; exit 1; }
+[ "$(id -u)" = 0 ] || fail 'Root privileges are required.'
+case "${1:-}" in
+ check) [ "$#" = 1 ] || fail 'Usage: chester-ota check' ;;
+ install) [ "$#" = 2 ] && [ "$2" = --confirm ] || fail 'Usage: chester-ota install --confirm' ;;
+ *) fail 'Usage: chester-ota check | chester-ota install --confirm' ;;
+esac
+MODE=$1
+for tool in openssl jq wget-ssl sha256sum ubus; do
+ command -v "$tool" >/dev/null || fail "Missing dependency: $tool"
+done
+[ -s "$KEY" ] || fail 'No trusted OTA signing key is installed.'
+mkdir "$LOCK" 2>/dev/null || fail 'Another OTA operation is active. Check running processes before removing a stale lock.'
+WORK=''
+cleanup() {
+ [ -z "$WORK" ] || rm -rf "$WORK"
+ rmdir "$LOCK" 2>/dev/null || true
+}
+trap cleanup EXIT
+trap 'exit 1' HUP INT TERM
+umask 077
+WORK=$(mktemp -d /tmp/chester-ota.XXXXXX)
+download_small() {
+ (ulimit -f 128; wget-ssl -q -T 30 -O "$2" "$1") || fail 'Cannot download stable OTA metadata over verified HTTPS.'
+ [ "$(wc -c < "$2")" -le 65536 ] || fail 'OTA metadata exceeds its size limit.'
+}
+download_small "$BASE_URL/ota.json" "$WORK/ota.json"
+download_small "$BASE_URL/ota.json.sig" "$WORK/ota.json.sig"
+openssl pkeyutl -verify -pubin -inkey "$KEY" -rawin -in "$WORK/ota.json" \
+ -sigfile "$WORK/ota.json.sig" >/dev/null 2>&1 || fail 'OTA metadata signature is invalid.'
+
+# No shell evaluation of manifest data; validate types, limits and URL exactly.
+jq -e --arg repo "$REPO" --argjson max "$MAX_IMAGE" '
+ def digit: . >= 48 and . <= 57;
+ def alnum: digit or (. >= 65 and . <= 90) or (. >= 97 and . <= 122);
+ def digits: length > 0 and (explode | all(.[]; digit));
+ type == "object" and .schema == 1 and .repository == $repo and
+ .hardware.board == "mediatek,evb6990_cpe_mt76_emmc" and
+ (.hardware.models | type == "array" and length > 0 and all(.[]; type == "string")) and
+ .release.status == "stable" and .release.boot_tested == true and
+ (.release.version | type == "string" and (split(".") | length == 4 and all(.[]; digits))) and
+ (.release.sequence | type == "number" and . >= 1 and . <= 2147483647 and floor == .) and
+ (.image.size | type == "number" and . > 0 and . <= $max and floor == .) and
+ (.image.filename | type == "string" and endswith(".bin") and (explode | length > 4 and (.[0] | alnum) and all(.[]; alnum or . == 46 or . == 95 or . == 45))) and
+ (.image.sha256 | type == "string" and length == 64 and (explode | all(.[]; digit or (. >= 97 and . <= 102)))) and
+ .image.url == ("https://github.com/" + $repo + "/releases/download/v" + .release.version + "/" + .image.filename)
+' "$WORK/ota.json" >/dev/null || fail 'Invalid metadata, wrong repository, or release is not marked hardware-tested stable.'
+board=$(ubus call system board) || fail 'Cannot identify this device.'
+[ "$(printf '%s' "$board" | jq -r .board_name)" = "$(jq -r .hardware.board "$WORK/ota.json")" ] || fail 'Firmware board does not match this device.'
+model=$(printf '%s' "$board" | jq -r .model)
+jq -e --arg model "$model" '.hardware.models | index($model) != null' "$WORK/ota.json" >/dev/null || fail 'Firmware model does not match this device.'
+installed=$(cat "$SEQUENCE_FILE" 2>/dev/null || printf '0')
+case "$installed" in ''|*[!0-9]*) fail 'Invalid installed OTA sequence.' ;; esac
+[ "${#installed}" -le 10 ] || fail 'Invalid installed OTA sequence.'
+next=$(jq -r .release.sequence "$WORK/ota.json")
+[ "$next" -gt "$installed" ] || fail 'No newer OTA sequence is available; downgrades are refused.'
+if [ "$MODE" = check ]; then
+ cat "$WORK/ota.json"
+ exit 0
+fi
+
+url=$(jq -r .image.url "$WORK/ota.json")
+size=$(jq -r .image.size "$WORK/ota.json")
+digest=$(jq -r .image.sha256 "$WORK/ota.json")
+# Bound tmpfs use even if the server sends a larger response than advertised.
+(ulimit -f 196608; wget-ssl -q -T 120 -O "$WORK/firmware.bin" "$url") || fail 'Firmware download failed.'
+[ "$(wc -c < "$WORK/firmware.bin")" = "$size" ] || fail 'Firmware length does not match the signed manifest.'
+[ "$(sha256sum "$WORK/firmware.bin" | cut -d ' ' -f 1)" = "$digest" ] || fail 'Firmware SHA256 does not match the signed manifest.'
+/sbin/sysupgrade -T "$WORK/firmware.bin" || fail 'The device rejected this firmware during sysupgrade validation.'
+# The target image must embed the signed sequence and the same trusted key.
+command -v unsquashfs >/dev/null || fail 'unsquashfs is required to validate the target OTA sequence.'
+(ulimit -f 196608; tar -xOzf "$WORK/firmware.bin" root.squashfs > "$WORK/root.squashfs") || fail 'Cannot read the target filesystem.'
+target_sequence=$(unsquashfs -cat "$WORK/root.squashfs" etc/chester-ota/installed-sequence) || fail 'Target image lacks its OTA sequence.'
+[ "$target_sequence" = "$next" ] || fail 'Target image sequence does not match the signed manifest.'
+unsquashfs -cat "$WORK/root.squashfs" etc/chester-ota/public.pem > "$WORK/target-public.pem" || fail 'Target image lacks the OTA key.'
+cmp -s "$KEY" "$WORK/target-public.pem" || fail 'Target image would change the trusted OTA signing key.'
+rm -f "$WORK/root.squashfs" "$WORK/target-public.pem"
+printf 'Installing signed OTA version %s. Do not disconnect power.\n' "$(jq -r .release.version "$WORK/ota.json")"
+# Installation is reachable only with the explicit root install --confirm command.
+# Existing configuration is preserved using the vendor sysupgrade defaults.
+/sbin/sysupgrade "$WORK/firmware.bin"
