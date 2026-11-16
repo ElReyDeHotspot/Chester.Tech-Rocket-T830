@@ -1,0 +1,9 @@
+*.bin
+*.img
+*.squashfs
+*.partial
+*.pem
+!public.pem
+*.key
+dist/
+__pycache__/

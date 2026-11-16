@@ -1,0 +1,23 @@
+{
+  "luci-app-chester-ota": {
+    "description": "Manage signed Chester firmware updates",
+    "read": {
+      "ubus": { "file": [ "exec" ] },
+      "file": {
+        "/usr/sbin/chester-ota settings": [ "exec" ],
+        "/usr/sbin/chester-ota status": [ "exec" ],
+        "/usr/sbin/chester-ota check": [ "exec" ]
+      }
+    },
+    "write": {
+      "ubus": { "file": [ "exec" ] },
+      "file": {
+        "/usr/sbin/chester-ota configure 0 0": [ "exec" ],
+        "/usr/sbin/chester-ota configure 0 1": [ "exec" ],
+        "/usr/sbin/chester-ota configure 1 0": [ "exec" ],
+        "/usr/sbin/chester-ota configure 1 1": [ "exec" ],
+        "/usr/sbin/chester-ota queue": [ "exec" ]
+      }
+    }
+  }
+}
