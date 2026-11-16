@@ -19,9 +19,13 @@ jobs:
       - name: Install test dependencies
         run: sudo apt-get update && sudo apt-get install --yes jq openssl
       - name: Validate shell syntax
-        run: bash -n firmware-overlay/usr/sbin/chester-ota
+        run: |
+          bash -n firmware-overlay/usr/sbin/chester-ota
+          bash -n firmware-overlay/etc/uci-defaults/98-chester-ota
       - name: Test signed metadata and isolated client behavior
         run: python3 -m unittest discover -s tests -v
+      - name: Test updater page controls
+        run: node tests/test_view.js
       - name: Refuse committed firmware and private keys
         shell: python
         run: |

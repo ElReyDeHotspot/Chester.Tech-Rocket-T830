@@ -1,0 +1,3 @@
+config update 'update'
+	option keep_settings '1'
+	option auto '0'

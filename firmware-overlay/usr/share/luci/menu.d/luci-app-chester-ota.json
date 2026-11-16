@@ -1,0 +1,8 @@
+{
+  "admin/system/gateway-system/ota": {
+    "title": "System Update",
+    "order": 21,
+    "action": { "type": "view", "path": "chester-ota/index" },
+    "depends": { "acl": [ "luci-app-chester-ota" ] }
+  }
+}

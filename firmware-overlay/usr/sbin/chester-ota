@@ -1,26 +1,79 @@
 #!/bin/sh
-# Root-only, signed, manually confirmed OTA for the Rocket T830 AP firmware.
+# Root-only, signed OTA with saved retain-data and opt-in automatic updates.
 set -eu
 REPO='ElReyDeHotspot/Chester.Tech-Rocket-T830'
 BASE_URL="https://github.com/$REPO/releases/latest/download"
 KEY=/etc/chester-ota/public.pem
 SEQUENCE_FILE=/etc/chester-ota/installed-sequence
 LOCK=/tmp/chester-ota.lock
+QUEUE_LOCK=/tmp/chester-ota-queue.lock
+STATE=/tmp/chester-ota-state.json
 MAX_IMAGE=100663296
 
-fail() { printf '%s\n' "$*" >&2; exit 1; }
+MODE=${1:-}
+write_state() {
+ state_tmp=$(mktemp /tmp/chester-ota-state.XXXXXX)
+ jq -n --arg phase "$1" --arg message "$2" '{phase:$phase,message:$message}' > "$state_tmp"
+ mv -f "$state_tmp" "$STATE"
+}
+fail() {
+ case "$MODE" in install|auto-run|queue) write_state failed "$*" 2>/dev/null || true ;; esac
+ printf '%s\n' "$*" >&2
+ exit 1
+}
+keep_settings() {
+ case "$(uci -q get chester.update.keep_settings 2>/dev/null || true)" in 0) echo 0 ;; *) echo 1 ;; esac
+}
+auto_enabled() { [ "$(uci -q get chester.update.auto 2>/dev/null || true)" = 1 ]; }
 [ "$(id -u)" = 0 ] || fail 'Root privileges are required.'
 case "${1:-}" in
+ settings)
+  [ "$#" = 1 ] || fail 'Usage: chester-ota settings'
+  keep=$(keep_settings); automatic=0; auto_enabled && automatic=1
+  sequence=$(cat "$SEQUENCE_FILE" 2>/dev/null || printf '0')
+  jq -n --argjson keep "$keep" --argjson automatic "$automatic" --arg sequence "$sequence" \
+   '{keep_settings:($keep==1),auto_update:($automatic==1),installed_sequence:$sequence}'
+  exit 0 ;;
+ status)
+  [ "$#" = 1 ] || fail 'Usage: chester-ota status'
+  if [ -s "$STATE" ] && jq -e 'type=="object" and (.phase|type=="string") and (.message|type=="string")' "$STATE" >/dev/null 2>&1; then
+   cat "$STATE"
+  else printf '%s\n' '{"phase":"idle","message":"No update is running."}'; fi
+  exit 0 ;;
+ configure)
+  [ "$#" = 3 ] || fail 'Usage: chester-ota configure KEEP AUTO (0 or 1)'
+  case "$2:$3" in 0:0|0:1|1:0|1:1) ;; *) fail 'Settings must be 0 or 1.' ;; esac
+  uci -q set chester.update=update
+  uci -q set "chester.update.keep_settings=$2"
+  uci -q set "chester.update.auto=$3"
+  uci -q commit chester
+  printf '%s\n' '{"ok":true}'
+  exit 0 ;;
+ queue)
+  [ "$#" = 1 ] || fail 'Usage: chester-ota queue'
+  [ ! -d "$LOCK" ] || fail 'An update is already running.'
+  mkdir "$QUEUE_LOCK" 2>/dev/null || fail 'An update is already queued.'
+  write_state queued 'Starting update checks.'
+  if ! /sbin/start-stop-daemon -S -b -x /usr/sbin/chester-ota -- install --confirm; then
+   rmdir "$QUEUE_LOCK" 2>/dev/null || true
+   fail 'Could not start the updater.'
+  fi
+  printf '%s\n' '{"queued":true}'
+  exit 0 ;;
+ auto-run)
+  [ "$#" = 1 ] || fail 'Usage: chester-ota auto-run'
+  auto_enabled || exit 0
+  [ ! -d "$LOCK" ] && [ ! -d "$QUEUE_LOCK" ] || exit 0 ;;
  check) [ "$#" = 1 ] || fail 'Usage: chester-ota check' ;;
  install) [ "$#" = 2 ] && [ "$2" = --confirm ] || fail 'Usage: chester-ota install --confirm' ;;
- *) fail 'Usage: chester-ota check | chester-ota install --confirm' ;;
+ *) fail 'Usage: chester-ota settings|status|configure KEEP AUTO|check|queue|auto-run|install --confirm' ;;
 esac
-MODE=$1
 for tool in openssl jq wget-ssl sha256sum ubus; do
  command -v "$tool" >/dev/null || fail "Missing dependency: $tool"
 done
 [ -s "$KEY" ] || fail 'No trusted OTA signing key is installed.'
 mkdir "$LOCK" 2>/dev/null || fail 'Another OTA operation is active. Check running processes before removing a stale lock.'
+rmdir "$QUEUE_LOCK" 2>/dev/null || true
 WORK=''
 cleanup() {
  [ -z "$WORK" ] || rm -rf "$WORK"
@@ -30,6 +83,8 @@ trap cleanup EXIT
 trap 'exit 1' HUP INT TERM
 umask 077
 WORK=$(mktemp -d /tmp/chester-ota.XXXXXX)
+KEEP=$(keep_settings)
+[ "$MODE" = check ] || write_state checking 'Checking signed stable update metadata.'
 download_small() {
  (ulimit -f 128; wget-ssl -q -T 30 -O "$2" "$1") || fail 'Cannot download stable OTA metadata over verified HTTPS.'
  [ "$(wc -c < "$2")" -le 65536 ] || fail 'OTA metadata exceeds its size limit.'
@@ -63,7 +118,10 @@ installed=$(cat "$SEQUENCE_FILE" 2>/dev/null || printf '0')
 case "$installed" in ''|*[!0-9]*) fail 'Invalid installed OTA sequence.' ;; esac
 [ "${#installed}" -le 10 ] || fail 'Invalid installed OTA sequence.'
 next=$(jq -r .release.sequence "$WORK/ota.json")
-[ "$next" -gt "$installed" ] || fail 'No newer OTA sequence is available; downgrades are refused.'
+[ "$next" -gt "$installed" ] || {
+ if [ "$MODE" = auto-run ]; then write_state idle 'This router is up to date.'; exit 0; fi
+ fail 'No newer OTA sequence is available; downgrades are refused.'
+}
 if [ "$MODE" = check ]; then
  cat "$WORK/ota.json"
  exit 0
@@ -72,10 +130,12 @@ fi
 url=$(jq -r .image.url "$WORK/ota.json")
 size=$(jq -r .image.size "$WORK/ota.json")
 digest=$(jq -r .image.sha256 "$WORK/ota.json")
+write_state downloading 'Downloading the signed firmware image.'
 # Bound tmpfs use even if the server sends a larger response than advertised.
 (ulimit -f 196608; wget-ssl -q -T 120 -O "$WORK/firmware.bin" "$url") || fail 'Firmware download failed.'
 [ "$(wc -c < "$WORK/firmware.bin")" = "$size" ] || fail 'Firmware length does not match the signed manifest.'
 [ "$(sha256sum "$WORK/firmware.bin" | cut -d ' ' -f 1)" = "$digest" ] || fail 'Firmware SHA256 does not match the signed manifest.'
+write_state validating 'Checking the firmware and target identity.'
 /sbin/sysupgrade -T "$WORK/firmware.bin" || fail 'The device rejected this firmware during sysupgrade validation.'
 # The target image must embed the signed sequence and the same trusted key.
 command -v unsquashfs >/dev/null || fail 'unsquashfs is required to validate the target OTA sequence.'
@@ -85,7 +145,15 @@ target_sequence=$(unsquashfs -cat "$WORK/root.squashfs" etc/chester-ota/installe
 unsquashfs -cat "$WORK/root.squashfs" etc/chester-ota/public.pem > "$WORK/target-public.pem" || fail 'Target image lacks the OTA key.'
 cmp -s "$KEY" "$WORK/target-public.pem" || fail 'Target image would change the trusted OTA signing key.'
 rm -f "$WORK/root.squashfs" "$WORK/target-public.pem"
+if [ "$MODE" = auto-run ] && ! auto_enabled; then
+ write_state idle 'Automatic updates were disabled; nothing was installed.'
+ exit 0
+fi
 printf 'Installing signed OTA version %s. Do not disconnect power.\n' "$(jq -r .release.version "$WORK/ota.json")"
-# Installation is reachable only with the explicit root install --confirm command.
-# Existing configuration is preserved using the vendor sysupgrade defaults.
-/sbin/sysupgrade "$WORK/firmware.bin"
+# Both manual and scheduled paths honor the same saved retain-data setting.
+write_state installing 'Installing firmware. Do not disconnect power.'
+if [ "$KEEP" = 0 ]; then
+ /sbin/sysupgrade -n "$WORK/firmware.bin"
+else
+ /sbin/sysupgrade "$WORK/firmware.bin"
+fi

@@ -1,0 +1,25 @@
+#!/bin/sh
+# Preserve saved preferences and other cron entries across upgrades.
+uci -q get chester.update >/dev/null || uci -q set chester.update=update
+uci -q get chester.update.keep_settings >/dev/null || uci -q set chester.update.keep_settings='1'
+uci -q get chester.update.auto >/dev/null || uci -q set chester.update.auto='0'
+uci -q commit chester
+
+if uci -q get misectel.clients >/dev/null; then
+	case " $(uci -q get misectel.clients.app_whitelist) " in
+	*' system/gateway-system/ota '*) ;;
+	*) uci -q add_list misectel.clients.app_whitelist='system/gateway-system/ota'; uci -q commit misectel ;;
+	esac
+fi
+
+mkdir -p /etc/crontabs
+cron_tmp=$(mktemp /tmp/chester-ota-cron.XXXXXX) || exit 1
+if [ -f /etc/crontabs/root ]; then
+	grep -v '# chester-ota$' /etc/crontabs/root > "$cron_tmp" || true
+fi
+printf '%s\n' '19 */6 * * * /usr/sbin/chester-ota auto-run >/dev/null 2>&1 # chester-ota' >> "$cron_tmp"
+chmod 600 "$cron_tmp"
+mv "$cron_tmp" /etc/crontabs/root
+/etc/init.d/cron enable
+/etc/init.d/cron restart
+exit 0

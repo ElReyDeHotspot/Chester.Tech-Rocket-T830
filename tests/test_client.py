@@ -43,25 +43,45 @@ class ClientTests(unittest.TestCase):
         self.boardfile = self.base / 'board.json'
         self.boardfile.write_text(json.dumps({'model': self.model, 'board_name': self.board}))
         self.receipt = self.base / 'flashed'
+        self.arguments = self.base / 'flash-arguments'
+        self.keep = self.base / 'keep'
+        self.automatic = self.base / 'automatic'
+        self.downloads = self.base / 'downloads'
+        self.keep.write_text('1\n')
+        self.automatic.write_text('0\n')
         q = shlex.quote
         self.write('id', '#!/bin/sh\necho 0\n')
         self.write('jq', '#!/bin/sh\nexec ' + q(str(JQ)) + ' "$@"\n')
         self.write('ubus', '#!/bin/sh\ncat ' + q(str(self.boardfile)) + '\n')
+        self.write('uci', '''#!/bin/sh
+[ "$1" = -q ] && shift
+case "$1:$2" in
+ get:chester.update.keep_settings) cat ''' + q(str(self.keep)) + ''';;
+ get:chester.update.auto) cat ''' + q(str(self.automatic)) + ''';;
+ set:chester.update.keep_settings=*) printf '%s\\n' "${2##*=}" > ''' + q(str(self.keep)) + ''';;
+ set:chester.update.auto=*) printf '%s\\n' "${2##*=}" > ''' + q(str(self.automatic)) + ''';;
+ set:chester.update=update|commit:chester) exit 0;;
+ *) exit 1;;
+esac
+''')
         self.write('wget-ssl', '''#!/bin/sh
 out=''
 while [ "$#" -gt 0 ]; do
  case "$1" in -O) out=$2; shift 2;; -T) shift 2;; -q) shift;; *) url=$1; shift;; esac
 done
 name=${url##*/}
+printf '%s\\n' "$name" >> ''' + q(str(self.downloads)) + '''
 case "$name" in ota.json|ota.json.sig|firmware.bin) ;; *) exit 1;; esac
 cp ''' + q(str(self.assets)) + '''/"$name" "$out"
 ''')
         self.write('unsquashfs', '#!/bin/sh\ncase "$3" in */installed-sequence) echo 1;; */public.pem) cat ' + q(str(self.public)) + ';; *) exit 1;; esac\n')
-        self.write('sysupgrade', '#!/bin/sh\n[ "$1" = -T ] && exit 0\nprintf simulated > ' + q(str(self.receipt)) + '\n')
+        self.write('sysupgrade', '#!/bin/sh\n[ "$1" = -T ] && exit 0\nprintf simulated > ' + q(str(self.receipt)) + '\nprintf "%s\\n" "$@" > ' + q(str(self.arguments)) + '\n')
         client = (ROOT / 'firmware-overlay/usr/sbin/chester-ota').read_text()
         client = client.replace('KEY=/etc/chester-ota/public.pem', 'KEY=' + q(str(self.public)))
         client = client.replace('SEQUENCE_FILE=/etc/chester-ota/installed-sequence', 'SEQUENCE_FILE=' + q(str(self.seq)))
         client = client.replace('LOCK=/tmp/chester-ota.lock', 'LOCK=' + q(str(self.base / 'lock')))
+        client = client.replace('QUEUE_LOCK=/tmp/chester-ota-queue.lock', 'QUEUE_LOCK=' + q(str(self.base / 'queue-lock')))
+        client = client.replace('STATE=/tmp/chester-ota-state.json', 'STATE=' + q(str(self.base / 'state.json')))
         client = client.replace('/sbin/sysupgrade', q(str(self.bin / 'sysupgrade')))
         self.client = self.base / 'client'
         self.client.write_text(client)
@@ -127,6 +147,54 @@ cp ''' + q(str(self.assets)) + '''/"$name" "$out"
         result = self.run_client('install', '--confirm')
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(self.receipt.read_text(), 'simulated')
+        self.assertNotIn('-n', self.arguments.read_text().splitlines())
+
+    def test_retain_off_passes_reset_flag(self):
+        self.keep.write_text('0\n')
+        result = self.run_client('install', '--confirm')
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self.arguments.read_text().splitlines()[0], '-n')
+
+    def test_auto_disabled_does_not_contact_server(self):
+        result = self.run_client('auto-run')
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertFalse(self.downloads.exists())
+        self.assertFalse(self.receipt.exists())
+
+    def test_enabled_auto_honors_retain_setting(self):
+        self.automatic.write_text('1\n')
+        self.keep.write_text('0\n')
+        result = self.run_client('auto-run')
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self.arguments.read_text().splitlines()[0], '-n')
+
+    def test_auto_does_not_reflash_current_version(self):
+        self.automatic.write_text('1\n')
+        self.seq.write_text('1\n')
+        result = self.run_client('auto-run')
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertFalse(self.receipt.exists())
+        self.assertEqual(self.downloads.read_text().splitlines(), ['ota.json', 'ota.json.sig'])
+
+    def test_configuration_roundtrip_and_validation(self):
+        result = self.run_client('configure', '0', '1')
+        self.assertEqual(result.returncode, 0, result.stderr)
+        result = self.run_client('settings')
+        settings = json.loads(result.stdout)
+        self.assertFalse(settings['keep_settings'])
+        self.assertTrue(settings['auto_update'])
+        self.assertNotEqual(self.run_client('configure', '2', '1').returncode, 0)
+        self.assertEqual(self.keep.read_text().strip(), '0')
+
+    def test_auto_disabled_during_download_cancels_install(self):
+        self.automatic.write_text('1\n')
+        wget = self.bin / 'wget-ssl'
+        wget.write_text(wget.read_text() + '\n[ "$name" != firmware.bin ] || printf "0\\n" > ' + shlex.quote(str(self.automatic)) + '\n')
+        result = self.run_client('auto-run')
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertFalse(self.receipt.exists())
+        state = json.loads((self.base / 'state.json').read_text())
+        self.assertEqual(state['phase'], 'idle')
 
 
 if __name__ == '__main__':
