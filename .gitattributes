@@ -1,0 +1,5 @@
+* text=auto
+firmware-overlay/** text eol=lf
+*.py text eol=lf
+*.yml text eol=lf
+*.md text eol=lf
